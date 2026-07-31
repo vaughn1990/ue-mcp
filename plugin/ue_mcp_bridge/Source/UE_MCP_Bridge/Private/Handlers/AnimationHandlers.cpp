@@ -19,6 +19,9 @@
 #include "PoseSearch/PoseSearchDerivedData.h"
 #include "Animation/AnimBlueprintGeneratedClass.h"
 #include "Animation/AnimNotifies/AnimNotify.h"
+#include "Animation/AnimNotifies/AnimNotifyState.h"
+#include "Animation/AnimNotifies/AnimNotifyState_DisableRootMotion.h"
+#include "HandlerJsonProperty.h"
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "Engine/SkeletalMeshSocket.h"
 // PhysicsEngine/SkeletalBodySetup.h is unavailable as a public include on
@@ -31,6 +34,7 @@
 #include "Factories/AnimMontageFactory.h"
 #include "Factories/BlendSpaceFactoryNew.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/UObjectIterator.h"
 #include "UObject/Package.h"
 #include "Misc/PackageName.h"
 #include "UObject/SavePackage.h"
@@ -40,6 +44,9 @@
 #include "Animation/AnimData/AnimDataModel.h"
 #include "Animation/AnimData/IAnimationDataModel.h"
 #include "Editor.h"
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+#endif
 
 // State machine authoring
 #include "AnimGraphNode_StateMachine.h"
@@ -64,6 +71,206 @@
 // Curve identifiers for UE5 animation data controller
 #include "Animation/AnimCurveTypes.h"
 #include "Animation/Skeleton.h"
+
+namespace
+{
+UObject* GetNotifyObject(const FAnimNotifyEvent& Event)
+{
+	return Event.Notify ? static_cast<UObject*>(Event.Notify) : static_cast<UObject*>(Event.NotifyStateClass);
+}
+
+UClass* ResolveAnimNotifyClass(const FString& ClassName)
+{
+	if (ClassName.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	if (UClass* LoadedClass = LoadObject<UClass>(nullptr, *ClassName))
+	{
+		return LoadedClass;
+	}
+	if (UClass* ExistingClass = FindFirstObject<UClass>(*ClassName, EFindFirstObjectOptions::NativeFirst))
+	{
+		return ExistingClass;
+	}
+
+	const FString PointPrefixed = ClassName.StartsWith(TEXT("AnimNotify_"))
+		? ClassName
+		: TEXT("AnimNotify_") + ClassName;
+	if (UClass* PointClass = FindFirstObject<UClass>(*PointPrefixed, EFindFirstObjectOptions::NativeFirst))
+	{
+		return PointClass;
+	}
+
+	const FString StatePrefixed = ClassName.StartsWith(TEXT("AnimNotifyState_"))
+		? ClassName
+		: TEXT("AnimNotifyState_") + ClassName;
+	if (UClass* StateClass = FindFirstObject<UClass>(*StatePrefixed, EFindFirstObjectOptions::NativeFirst))
+	{
+		return StateClass;
+	}
+
+	for (TObjectIterator<UClass> It; It; ++It)
+	{
+		if (It->GetName().Equals(ClassName, ESearchCase::IgnoreCase)
+			|| It->GetPathName().Equals(ClassName, ESearchCase::IgnoreCase)
+			|| It->GetName().Equals(PointPrefixed, ESearchCase::IgnoreCase)
+			|| It->GetName().Equals(StatePrefixed, ESearchCase::IgnoreCase))
+		{
+			return *It;
+		}
+	}
+	return nullptr;
+}
+
+bool EventMatchesClass(const FAnimNotifyEvent& Event, UClass* MatchClass)
+{
+	if (!MatchClass)
+	{
+		return false;
+	}
+	return (Event.Notify && Event.Notify->GetClass()->IsChildOf(MatchClass))
+		|| (Event.NotifyStateClass && Event.NotifyStateClass->GetClass()->IsChildOf(MatchClass));
+}
+
+void ExportNotifyProperties(
+	UObject* Object,
+	const FString& Prefix,
+	int32 RemainingObjectDepth,
+	const TSharedPtr<FJsonObject>& OutProperties)
+{
+	if (!Object || !OutProperties.IsValid())
+	{
+		return;
+	}
+
+	for (TFieldIterator<FProperty> It(Object->GetClass(), EFieldIterationFlags::IncludeSuper); It; ++It)
+	{
+		FProperty* Property = *It;
+		if (Property->HasAnyPropertyFlags(CPF_Transient | CPF_Deprecated)
+			|| !Property->HasAnyPropertyFlags(CPF_Edit))
+		{
+			continue;
+		}
+
+		void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Object);
+		const FString PropertyPath = Prefix + Property->GetName();
+		FObjectProperty* ObjectProperty = CastField<FObjectProperty>(Property);
+		UObject* SubObject = ObjectProperty ? ObjectProperty->GetObjectPropertyValue(ValuePtr) : nullptr;
+		const bool bOwnedSubObject = SubObject && SubObject->IsIn(Object);
+		if (!bOwnedSubObject)
+		{
+			FString ExportedValue;
+			Property->ExportTextItem_Direct(ExportedValue, ValuePtr, nullptr, Object, PPF_None);
+			OutProperties->SetStringField(PropertyPath, ExportedValue);
+		}
+
+		if (RemainingObjectDepth > 0 && bOwnedSubObject)
+		{
+			ExportNotifyProperties(
+				SubObject,
+				PropertyPath + TEXT("."),
+				RemainingObjectDepth - 1,
+				OutProperties);
+		}
+	}
+}
+
+TSharedPtr<FJsonObject> AnimNotifyEventToJson(const FAnimNotifyEvent& Event, int32 NotifyIndex)
+{
+	TSharedPtr<FJsonObject> NotifyObj = MakeShared<FJsonObject>();
+	NotifyObj->SetNumberField(TEXT("notifyIndex"), NotifyIndex);
+	NotifyObj->SetStringField(TEXT("name"), Event.NotifyName.ToString());
+	NotifyObj->SetNumberField(TEXT("triggerTime"), Event.GetTriggerTime());
+	NotifyObj->SetNumberField(TEXT("duration"), Event.GetDuration());
+	NotifyObj->SetNumberField(TEXT("endTime"), Event.GetTriggerTime() + Event.GetDuration());
+	NotifyObj->SetNumberField(TEXT("trackIndex"), Event.TrackIndex);
+	NotifyObj->SetStringField(TEXT("guid"), Event.Guid.ToString(EGuidFormats::DigitsWithHyphens));
+
+	if (UObject* NotifyObject = GetNotifyObject(Event))
+	{
+		NotifyObj->SetStringField(TEXT("kind"), Event.NotifyStateClass ? TEXT("state") : TEXT("point"));
+		NotifyObj->SetStringField(TEXT("class"), NotifyObject->GetClass()->GetName());
+		NotifyObj->SetStringField(TEXT("classPath"), NotifyObject->GetClass()->GetPathName());
+		NotifyObj->SetStringField(TEXT("objectPath"), NotifyObject->GetPathName());
+		TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+		ExportNotifyProperties(NotifyObject, FString(), 1, Properties);
+		NotifyObj->SetObjectField(TEXT("properties"), Properties);
+	}
+	else
+	{
+		NotifyObj->SetStringField(TEXT("kind"), TEXT("named"));
+	}
+	return NotifyObj;
+}
+
+bool ExportDottedProperty(UObject* Object, const FString& PropertyPath, FString& OutValue, FString& OutError)
+{
+	FProperty* Property = nullptr;
+	void* ValuePtr = nullptr;
+	UObject* LeafOwner = nullptr;
+	if (!MCPJsonProperty::ResolveDottedPath(
+			Object,
+			PropertyPath,
+			Property,
+			ValuePtr,
+			LeafOwner,
+			OutError))
+	{
+		return false;
+	}
+	Property->ExportTextItem_Direct(OutValue, ValuePtr, nullptr, LeafOwner, PPF_None);
+	return true;
+}
+
+bool ApplyNotifyProperties(
+	UObject* NotifyObject,
+	const TSharedPtr<FJsonObject>& Props,
+	TMap<FString, FString>* PreviousValues,
+	bool* bOutChanged,
+	FString& OutError)
+{
+	if (!Props.IsValid())
+	{
+		return true;
+	}
+	for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Props->Values)
+	{
+		if (Pair.Key.Equals(TEXT("duration"), ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+
+		FString PreviousValue;
+		if (!ExportDottedProperty(NotifyObject, Pair.Key, PreviousValue, OutError))
+		{
+			OutError = FString::Printf(TEXT("%s: %s"), *Pair.Key, *OutError);
+			return false;
+		}
+		if (PreviousValues)
+		{
+			PreviousValues->Add(Pair.Key, PreviousValue);
+		}
+		if (!MCPJsonProperty::SetDottedPropertyFromJson(NotifyObject, Pair.Key, Pair.Value, OutError))
+		{
+			OutError = FString::Printf(TEXT("%s: %s"), *Pair.Key, *OutError);
+			return false;
+		}
+
+		FString UpdatedValue;
+		if (!ExportDottedProperty(NotifyObject, Pair.Key, UpdatedValue, OutError))
+		{
+			return false;
+		}
+		if (bOutChanged && PreviousValue != UpdatedValue)
+		{
+			*bOutChanged = true;
+		}
+	}
+	return true;
+}
+}
 
 void FAnimationHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 {
@@ -520,17 +727,10 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ReadAnimMontage(const TSharedPtr<FJso
 
 	// Notifies
 	TArray<TSharedPtr<FJsonValue>> NotifiesArray;
-	for (const FAnimNotifyEvent& NotifyEvent : Montage->Notifies)
+	for (int32 NotifyIndex = 0; NotifyIndex < Montage->Notifies.Num(); ++NotifyIndex)
 	{
-		TSharedPtr<FJsonObject> NotifyObj = MakeShared<FJsonObject>();
-		NotifyObj->SetStringField(TEXT("name"), NotifyEvent.NotifyName.ToString());
-		NotifyObj->SetNumberField(TEXT("triggerTime"), NotifyEvent.GetTriggerTime());
-		NotifyObj->SetNumberField(TEXT("duration"), NotifyEvent.GetDuration());
-		if (NotifyEvent.Notify)
-		{
-			NotifyObj->SetStringField(TEXT("class"), NotifyEvent.Notify->GetClass()->GetName());
-		}
-		NotifiesArray.Add(MakeShared<FJsonValueObject>(NotifyObj));
+		NotifiesArray.Add(MakeShared<FJsonValueObject>(
+			AnimNotifyEventToJson(Montage->Notifies[NotifyIndex], NotifyIndex)));
 	}
 	Result->SetArrayField(TEXT("notifies"), NotifiesArray);
 
@@ -741,7 +941,14 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddAnimNotify(const TSharedPtr<FJsonO
 		return MCPError(TEXT("Missing 'triggerTime' parameter"));
 	}
 
-	FString NotifyClassName = OptionalString(Params, TEXT("notifyClass"));
+	const FString NotifyClassName = OptionalString(Params, TEXT("notifyClass"));
+	const FString NotifyGuidString = OptionalString(Params, TEXT("notifyGuid"));
+	const TSharedPtr<FJsonObject>* PropsPtr = nullptr;
+	if (!Params->TryGetObjectField(TEXT("props"), PropsPtr))
+	{
+		Params->TryGetObjectField(TEXT("notifyProperties"), PropsPtr);
+	}
+	const TSharedPtr<FJsonObject> Props = PropsPtr ? *PropsPtr : nullptr;
 
 	// Load the animation asset — could be a montage or a sequence
 	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
@@ -751,112 +958,249 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddAnimNotify(const TSharedPtr<FJsonO
 		return MCPError(FString::Printf(TEXT("Failed to load AnimSequenceBase at '%s'"), *AssetPath));
 	}
 
-	// Clamp trigger time to valid range
-	float PlayLength = AnimAsset->GetPlayLength();
-	float ClampedTime = FMath::Clamp(static_cast<float>(TriggerTime), 0.0f, PlayLength);
+	const float PlayLength = AnimAsset->GetPlayLength();
+	const float ClampedTime = FMath::Clamp(static_cast<float>(TriggerTime), 0.0f, PlayLength);
+	double RequestedDuration = 0.0;
+	bool bHasDuration = Params->TryGetNumberField(TEXT("duration"), RequestedDuration);
+	if (!bHasDuration && Props.IsValid())
+	{
+		bHasDuration = Props->TryGetNumberField(TEXT("duration"), RequestedDuration);
+	}
+	const float ClampedDuration = bHasDuration
+		? FMath::Clamp(static_cast<float>(RequestedDuration), 0.0f, PlayLength - ClampedTime)
+		: 0.0f;
+	double RequestedTrackIndexNumber = 0.0;
+	const bool bHasTrackIndex = Params->TryGetNumberField(TEXT("trackIndex"), RequestedTrackIndexNumber);
+	const int32 RequestedTrackIndex = FMath::Max(0, static_cast<int32>(RequestedTrackIndexNumber));
 
-	// Idempotency: check for existing notify with same name at same trigger time
+	UClass* NotifyClass = ResolveAnimNotifyClass(NotifyClassName);
+	if (!NotifyClassName.IsEmpty()
+		&& (!NotifyClass
+			|| (!NotifyClass->IsChildOf(UAnimNotify::StaticClass())
+				&& !NotifyClass->IsChildOf(UAnimNotifyState::StaticClass()))))
+	{
+		return MCPError(FString::Printf(
+			TEXT("Notify class '%s' was not found or is not an AnimNotify/AnimNotifyState"),
+			*NotifyClassName));
+	}
+
+	FGuid RequestedGuid;
+	if (!NotifyGuidString.IsEmpty() && !FGuid::Parse(NotifyGuidString, RequestedGuid))
+	{
+		return MCPError(FString::Printf(TEXT("Invalid notifyGuid '%s'"), *NotifyGuidString));
+	}
+
 	const FName NotifyFName(*NotifyName);
-	for (const FAnimNotifyEvent& Existing : AnimAsset->Notifies)
+	int32 ExistingIndex = INDEX_NONE;
+	for (int32 Index = 0; Index < AnimAsset->Notifies.Num(); ++Index)
 	{
-		if (Existing.NotifyName == NotifyFName && FMath::IsNearlyEqual(Existing.GetTime(), ClampedTime, 0.001f))
+		const FAnimNotifyEvent& Existing = AnimAsset->Notifies[Index];
+		const bool bGuidMatches = RequestedGuid.IsValid() && Existing.Guid == RequestedGuid;
+		const bool bIdentityMatches = !RequestedGuid.IsValid()
+			&& Existing.NotifyName == NotifyFName
+			&& FMath::IsNearlyEqual(Existing.GetTime(), ClampedTime, 0.001f)
+			&& (!NotifyClass || EventMatchesClass(Existing, NotifyClass));
+		if (bGuidMatches || bIdentityMatches)
 		{
-			auto ExistedRes = MCPSuccess();
-			MCPSetExisted(ExistedRes);
-			ExistedRes->SetStringField(TEXT("assetPath"), AssetPath);
-			ExistedRes->SetStringField(TEXT("notifyName"), NotifyName);
-			ExistedRes->SetNumberField(TEXT("triggerTime"), ClampedTime);
-			return MCPResult(ExistedRes);
+			ExistingIndex = Index;
+			break;
 		}
 	}
 
-	// If a notify class is specified, try to find and instantiate it
-	UAnimNotify* NewNotify = nullptr;
-	if (!NotifyClassName.IsEmpty())
+	const bool bCreated = ExistingIndex == INDEX_NONE;
+	FAnimNotifyEvent PreviousEvent;
+	if (!bCreated)
 	{
-		UClass* NotifyClass = FindFirstObject<UClass>(*NotifyClassName);
-		if (!NotifyClass)
+		PreviousEvent = AnimAsset->Notifies[ExistingIndex];
+	}
+
+	FAnimNotifyEvent& Event = bCreated
+		? AnimAsset->Notifies.AddDefaulted_GetRef()
+		: AnimAsset->Notifies[ExistingIndex];
+	if (bCreated)
+	{
+		Event.Guid = RequestedGuid.IsValid() ? RequestedGuid : FGuid::NewGuid();
+		if (NotifyClass && NotifyClass->IsChildOf(UAnimNotifyState::StaticClass()))
 		{
-			// Try with full path prefix
-			NotifyClass = FindFirstObject<UClass>(*(TEXT("AnimNotify_") + NotifyClassName));
+			Event.NotifyStateClass = NewObject<UAnimNotifyState>(AnimAsset, NotifyClass);
 		}
-		if (NotifyClass && NotifyClass->IsChildOf(UAnimNotify::StaticClass()))
+		else if (NotifyClass && NotifyClass->IsChildOf(UAnimNotify::StaticClass()))
 		{
-			NewNotify = NewObject<UAnimNotify>(AnimAsset, NotifyClass);
+			Event.Notify = NewObject<UAnimNotify>(AnimAsset, NotifyClass);
+		}
+	}
+	else if (NotifyClass && !EventMatchesClass(Event, NotifyClass))
+	{
+		return MCPError(FString::Printf(
+			TEXT("notifyGuid '%s' exists but has class '%s', not '%s'"),
+			*NotifyGuidString,
+			GetNotifyObject(Event) ? *GetNotifyObject(Event)->GetClass()->GetPathName() : TEXT("None"),
+			*NotifyClass->GetPathName()));
+	}
+
+	const float PreviousTime = Event.GetTime();
+	const int32 PreviousTrackIndex = Event.TrackIndex;
+	const FName PreviousName = Event.NotifyName;
+	Event.NotifyName = NotifyFName;
+	Event.Link(AnimAsset, ClampedTime);
+	Event.TriggerTimeOffset = GetTriggerTimeOffsetForType(AnimAsset->CalculateOffsetForNotify(ClampedTime));
+	Event.TrackIndex = bHasTrackIndex ? RequestedTrackIndex : (bCreated ? 0 : Event.TrackIndex);
+	if (Event.NotifyStateClass)
+	{
+		const float Duration = bHasDuration ? ClampedDuration : (bCreated ? 0.0f : Event.GetDuration());
+		Event.SetDuration(Duration);
+		Event.EndLink.Link(AnimAsset, ClampedTime + Duration);
+		Event.EndTriggerTimeOffset = GetTriggerTimeOffsetForType(
+			AnimAsset->CalculateOffsetForNotify(ClampedTime + Duration));
+	}
+
+	UObject* NotifyObject = GetNotifyObject(Event);
+	if (NotifyObject)
+	{
+		// PlayMontageNotify and PlayMontageNotifyWindow broadcast the object's
+		// NotifyName, so mirror the event name when that property exists.
+		if (FNameProperty* NameProp = CastField<FNameProperty>(
+				NotifyObject->GetClass()->FindPropertyByName(TEXT("NotifyName"))))
+		{
+			NameProp->SetPropertyValue_InContainer(NotifyObject, NotifyFName);
 		}
 	}
 
-	// Create the notify event
-	FAnimNotifyEvent& NewEvent = AnimAsset->Notifies.AddDefaulted_GetRef();
-	NewEvent.NotifyName = FName(*NotifyName);
-	NewEvent.Link(AnimAsset, ClampedTime);
-	NewEvent.TriggerTimeOffset = GetTriggerTimeOffsetForType(AnimAsset->CalculateOffsetForNotify(ClampedTime));
-	NewEvent.TrackIndex = 0;
-
-	if (NewNotify)
+	TMap<FString, FString> PreviousPropertyValues;
+	bool bPropertiesChanged = false;
+	FString PropertyError;
+	if (!ApplyNotifyProperties(
+			NotifyObject,
+			Props,
+			bCreated ? nullptr : &PreviousPropertyValues,
+			&bPropertiesChanged,
+			PropertyError))
 	{
-		NewEvent.Notify = NewNotify;
-
-		// #528: UAnimNotify_PlayMontageNotify::BranchingPointNotify broadcasts the
-		// NOTIFY OBJECT's own NotifyName, not the FAnimNotifyEvent's. We only set
-		// the event name above, so any name-based routing in user code received
-		// 'None'. Mirror the requested name onto the notify object's NotifyName
-		// property (present on PlayMontageNotify / PlayMontageNotifyWindow) so
-		// OnPlayMontageNotifyBegin broadcasts the correct name.
-		if (FNameProperty* NameProp = CastField<FNameProperty>(NewNotify->GetClass()->FindPropertyByName(TEXT("NotifyName"))))
+		if (bCreated)
 		{
-			NameProp->SetPropertyValue_InContainer(NewNotify, NotifyFName);
+			AnimAsset->Notifies.RemoveAt(AnimAsset->Notifies.Num() - 1);
 		}
+		else
+		{
+			Event = PreviousEvent;
+			for (const TPair<FString, FString>& Pair : PreviousPropertyValues)
+			{
+				FString RestoreError;
+				MCPJsonProperty::SetDottedPropertyFromJson(
+					GetNotifyObject(Event),
+					Pair.Key,
+					MakeShared<FJsonValueString>(Pair.Value),
+					RestoreError);
+			}
+		}
+		return MCPError(FString::Printf(TEXT("Failed to apply notify props: %s"), *PropertyError));
 	}
+
+	const bool bChanged = bCreated
+		|| PreviousName != Event.NotifyName
+		|| !FMath::IsNearlyEqual(PreviousTime, Event.GetTime())
+		|| PreviousTrackIndex != Event.TrackIndex
+		|| (bHasDuration && !FMath::IsNearlyEqual(PreviousEvent.GetDuration(), Event.GetDuration()))
+		|| bPropertiesChanged;
+	const FGuid EventGuid = Event.Guid;
 
 	AnimAsset->SortNotifies();
-
-	// #528: PostEditChange + save rebuilds the montage's branching-point markers
-	// from the notifies (RefreshBranchingPointMarkers itself is private), so the
-	// notify fires as a branching point with the name just written.
+	AnimAsset->RefreshCacheData();
 	AnimAsset->PostEditChange();
 	AnimAsset->MarkPackageDirty();
-
-	// Save the asset
-	UEditorAssetLibrary::SaveAsset(AssetPath);
+	if (!UEditorAssetLibrary::SaveAsset(AssetPath))
+	{
+		return MCPError(FString::Printf(TEXT("Failed to save animation asset '%s'"), *AssetPath));
+	}
 
 	auto Result = MCPSuccess();
-	MCPSetCreated(Result);
-	Result->SetStringField(TEXT("assetPath"), AssetPath);
-	Result->SetStringField(TEXT("notifyName"), NotifyName);
-	Result->SetNumberField(TEXT("triggerTime"), ClampedTime);
-	if (NewNotify)
+	if (bCreated)
 	{
-		Result->SetStringField(TEXT("notifyClass"), NewNotify->GetClass()->GetName());
+		MCPSetCreated(Result);
 	}
-	// #471: paired remove handler now exists.
-	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
-	Payload->SetStringField(TEXT("assetPath"), AssetPath);
-	Payload->SetStringField(TEXT("notifyName"), NotifyName);
-	MCPSetRollback(Result, TEXT("remove_anim_notify"), Payload);
+	else if (bChanged)
+	{
+		MCPSetUpdated(Result);
+	}
+	else
+	{
+		MCPSetExisted(Result);
+	}
+	Result->SetStringField(TEXT("assetPath"), AssetPath);
+	for (int32 Index = 0; Index < AnimAsset->Notifies.Num(); ++Index)
+	{
+		if (AnimAsset->Notifies[Index].Guid == EventGuid)
+		{
+			Result->SetObjectField(TEXT("notify"), AnimNotifyEventToJson(AnimAsset->Notifies[Index], Index));
+			break;
+		}
+	}
+
+	if (bCreated)
+	{
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetStringField(TEXT("assetPath"), AssetPath);
+		Payload->SetStringField(TEXT("notifyGuid"), EventGuid.ToString(EGuidFormats::DigitsWithHyphens));
+		MCPSetRollback(Result, TEXT("remove_anim_notify"), Payload);
+	}
+	else if (bChanged)
+	{
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetStringField(TEXT("assetPath"), AssetPath);
+		Payload->SetStringField(TEXT("notifyGuid"), EventGuid.ToString(EGuidFormats::DigitsWithHyphens));
+		Payload->SetStringField(TEXT("notifyName"), PreviousEvent.NotifyName.ToString());
+		Payload->SetNumberField(TEXT("triggerTime"), PreviousEvent.GetTime());
+		Payload->SetNumberField(TEXT("duration"), PreviousEvent.GetDuration());
+		Payload->SetNumberField(TEXT("trackIndex"), PreviousEvent.TrackIndex);
+		if (UObject* PreviousObject = GetNotifyObject(PreviousEvent))
+		{
+			Payload->SetStringField(TEXT("notifyClass"), PreviousObject->GetClass()->GetPathName());
+		}
+		if (PreviousPropertyValues.Num() > 0)
+		{
+			TSharedPtr<FJsonObject> PreviousProps = MakeShared<FJsonObject>();
+			for (const TPair<FString, FString>& Pair : PreviousPropertyValues)
+			{
+				PreviousProps->SetStringField(Pair.Key, Pair.Value);
+			}
+			Payload->SetObjectField(TEXT("props"), PreviousProps);
+		}
+		MCPSetRollback(Result, TEXT("add_anim_notify"), Payload);
+	}
 
 	return MCPResult(Result);
 }
 
-// #471: remove notifies by name (and optionally by class). Idempotent -
-// returns alreadyDeleted=true if no matching notifies exist. Useful for
-// ability/montage migration scripts that need to prune obsolete notify
-// instances (AuraFireLoopReady, AuraFire, etc.) before adding new ones.
-//
-// Params: assetPath, notifyName? (string), notifyClass? (string class name
-//         or AnimNotify_ prefixed). Pass either or both - both filters
-//         apply (AND). Returns the count and timestamps of removed
-//         instances.
+// Remove point notifies or notify states using any combination of name, class,
+// GUID, index, and trigger-time filters. Supplied filters are combined.
+// Removing one event returns a complete add/upsert rollback payload.
 TSharedPtr<FJsonValue> FAnimationHandlers::RemoveAnimNotify(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
 
-	FString NotifyName = OptionalString(Params, TEXT("notifyName"));
-	FString NotifyClassName = OptionalString(Params, TEXT("notifyClass"));
-	if (NotifyName.IsEmpty() && NotifyClassName.IsEmpty())
+	const FString NotifyName = OptionalString(Params, TEXT("notifyName"));
+	const FString NotifyClassName = OptionalString(Params, TEXT("notifyClass"));
+	const FString NotifyGuidString = OptionalString(Params, TEXT("notifyGuid"));
+	double NotifyIndexNumber = 0.0;
+	const bool bHasNotifyIndex = Params->TryGetNumberField(TEXT("notifyIndex"), NotifyIndexNumber);
+	double TriggerTime = 0.0;
+	const bool bHasTriggerTime = Params->TryGetNumberField(TEXT("triggerTime"), TriggerTime);
+	if (NotifyName.IsEmpty()
+		&& NotifyClassName.IsEmpty()
+		&& NotifyGuidString.IsEmpty()
+		&& !bHasNotifyIndex
+		&& !bHasTriggerTime)
 	{
-		return MCPError(TEXT("Pass at least one of 'notifyName' or 'notifyClass'"));
+		return MCPError(TEXT(
+			"Pass at least one of 'notifyName', 'notifyClass', 'notifyGuid', "
+			"'notifyIndex', or 'triggerTime'"));
+	}
+
+	FGuid NotifyGuid;
+	if (!NotifyGuidString.IsEmpty() && !FGuid::Parse(NotifyGuidString, NotifyGuid))
+	{
+		return MCPError(FString::Printf(TEXT("Invalid notifyGuid '%s'"), *NotifyGuidString));
 	}
 
 	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
@@ -866,50 +1210,86 @@ TSharedPtr<FJsonValue> FAnimationHandlers::RemoveAnimNotify(const TSharedPtr<FJs
 		return MCPError(FString::Printf(TEXT("Failed to load AnimSequenceBase at '%s'"), *AssetPath));
 	}
 
-	UClass* MatchClass = nullptr;
-	if (!NotifyClassName.IsEmpty())
+	UClass* MatchClass = ResolveAnimNotifyClass(NotifyClassName);
+	if (!NotifyClassName.IsEmpty() && !MatchClass)
 	{
-		MatchClass = FindFirstObject<UClass>(*NotifyClassName);
-		if (!MatchClass) MatchClass = FindFirstObject<UClass>(*(TEXT("AnimNotify_") + NotifyClassName));
+		return MCPError(FString::Printf(TEXT("Notify class '%s' was not found"), *NotifyClassName));
 	}
 
 	const FName NotifyFName(*NotifyName);
-	TArray<TSharedPtr<FJsonValue>> RemovedTimes;
+	const int32 NotifyIndex = bHasNotifyIndex ? static_cast<int32>(NotifyIndexNumber) : INDEX_NONE;
+	TArray<TSharedPtr<FJsonValue>> RemovedEvents;
+	TSharedPtr<FJsonObject> SingleRestorePayload;
 	for (int32 i = AnimAsset->Notifies.Num() - 1; i >= 0; --i)
 	{
 		const FAnimNotifyEvent& E = AnimAsset->Notifies[i];
 		const bool bNameMatches = NotifyName.IsEmpty() || E.NotifyName == NotifyFName;
-		const bool bClassMatches = NotifyClassName.IsEmpty() ||
-			(E.Notify && MatchClass && E.Notify->GetClass()->IsChildOf(MatchClass));
-		if (bNameMatches && bClassMatches)
+		const bool bClassMatches = NotifyClassName.IsEmpty() || EventMatchesClass(E, MatchClass);
+		const bool bGuidMatches = NotifyGuidString.IsEmpty() || E.Guid == NotifyGuid;
+		const bool bIndexMatches = !bHasNotifyIndex || i == NotifyIndex;
+		const bool bTimeMatches = !bHasTriggerTime
+			|| FMath::IsNearlyEqual(E.GetTime(), static_cast<float>(TriggerTime), 0.001f);
+		if (bNameMatches && bClassMatches && bGuidMatches && bIndexMatches && bTimeMatches)
 		{
-			RemovedTimes.Add(MakeShared<FJsonValueNumber>(E.GetTime()));
+			TSharedPtr<FJsonObject> RemovedEvent = AnimNotifyEventToJson(E, i);
+			RemovedEvents.Add(MakeShared<FJsonValueObject>(RemovedEvent));
+			if (RemovedEvents.Num() == 1)
+			{
+				SingleRestorePayload = MakeShared<FJsonObject>();
+				SingleRestorePayload->SetStringField(TEXT("assetPath"), AssetPath);
+				SingleRestorePayload->SetStringField(TEXT("notifyName"), E.NotifyName.ToString());
+				SingleRestorePayload->SetStringField(
+					TEXT("notifyGuid"),
+					E.Guid.ToString(EGuidFormats::DigitsWithHyphens));
+				SingleRestorePayload->SetNumberField(TEXT("triggerTime"), E.GetTime());
+				SingleRestorePayload->SetNumberField(TEXT("duration"), E.GetDuration());
+				SingleRestorePayload->SetNumberField(TEXT("trackIndex"), E.TrackIndex);
+				if (UObject* NotifyObject = GetNotifyObject(E))
+				{
+					SingleRestorePayload->SetStringField(
+						TEXT("notifyClass"),
+						NotifyObject->GetClass()->GetPathName());
+					SingleRestorePayload->SetObjectField(
+						TEXT("props"),
+						RemovedEvent->GetObjectField(TEXT("properties")));
+				}
+			}
 			AnimAsset->Notifies.RemoveAt(i);
 		}
 	}
 
-	if (RemovedTimes.Num() == 0)
+	if (RemovedEvents.Num() == 0)
 	{
 		auto Noop = MCPSuccess();
 		Noop->SetBoolField(TEXT("alreadyDeleted"), true);
 		Noop->SetStringField(TEXT("assetPath"), AssetPath);
 		Noop->SetStringField(TEXT("notifyName"), NotifyName);
 		Noop->SetStringField(TEXT("notifyClass"), NotifyClassName);
+		Noop->SetStringField(TEXT("notifyGuid"), NotifyGuidString);
 		return MCPResult(Noop);
 	}
 
 	AnimAsset->SortNotifies();
+	AnimAsset->RefreshCacheData();
 	AnimAsset->PostEditChange();
 	AnimAsset->MarkPackageDirty();
-	UEditorAssetLibrary::SaveAsset(AssetPath);
+	if (!UEditorAssetLibrary::SaveAsset(AssetPath))
+	{
+		return MCPError(FString::Printf(TEXT("Failed to save animation asset '%s'"), *AssetPath));
+	}
 
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("assetPath"), AssetPath);
 	Result->SetStringField(TEXT("notifyName"), NotifyName);
 	Result->SetStringField(TEXT("notifyClass"), NotifyClassName);
-	Result->SetNumberField(TEXT("removedCount"), RemovedTimes.Num());
-	Result->SetArrayField(TEXT("removedTimes"), RemovedTimes);
+	Result->SetStringField(TEXT("notifyGuid"), NotifyGuidString);
+	Result->SetNumberField(TEXT("removedCount"), RemovedEvents.Num());
+	Result->SetArrayField(TEXT("removed"), RemovedEvents);
+	if (RemovedEvents.Num() == 1 && SingleRestorePayload.IsValid())
+	{
+		MCPSetRollback(Result, TEXT("add_anim_notify"), SingleRestorePayload);
+	}
 	return MCPResult(Result);
 }
 
@@ -1950,3 +2330,47 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetAnimBlueprintSkeleton(const TShare
 	Result->SetStringField(TEXT("skeletonPath"), SkeletonPath);
 	return MCPResult(Result);
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FAnimationNotifyStateMetadataTest,
+	"UE_MCP.Animation.NotifyStateMetadata",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FAnimationNotifyStateMetadataTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	UAnimMontage* Montage = NewObject<UAnimMontage>(GetTransientPackage());
+	UAnimNotifyState_DisableRootMotion* NotifyState =
+		NewObject<UAnimNotifyState_DisableRootMotion>(Montage);
+
+	FAnimNotifyEvent Event;
+	Event.NotifyName = TEXT("RootMotionWindow");
+	Event.NotifyStateClass = NotifyState;
+	Event.Guid = FGuid::NewGuid();
+	Event.TrackIndex = 3;
+	Event.SetTime(1.25f);
+	Event.SetDuration(0.8f);
+
+	TestTrue(
+		TEXT("Notify states match their base class"),
+		EventMatchesClass(Event, UAnimNotifyState::StaticClass()));
+
+	const TSharedPtr<FJsonObject> Json = AnimNotifyEventToJson(Event, 7);
+	TestEqual(TEXT("Kind is state"), Json->GetStringField(TEXT("kind")), FString(TEXT("state")));
+	TestEqual(TEXT("Index is preserved"), Json->GetIntegerField(TEXT("notifyIndex")), 7);
+	TestEqual(TEXT("Track is preserved"), Json->GetIntegerField(TEXT("trackIndex")), 3);
+	TestTrue(
+		TEXT("Duration is preserved"),
+		FMath::IsNearlyEqual(Json->GetNumberField(TEXT("duration")), 0.8, 0.0001));
+	TestEqual(
+		TEXT("Class path is preserved"),
+		Json->GetStringField(TEXT("classPath")),
+		NotifyState->GetClass()->GetPathName());
+	TestEqual(
+		TEXT("GUID is preserved"),
+		Json->GetStringField(TEXT("guid")),
+		Event.Guid.ToString(EGuidFormats::DigitsWithHyphens));
+	return true;
+}
+#endif
