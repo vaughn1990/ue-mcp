@@ -20,6 +20,10 @@ so fields such as `RootMotionModifier.WarpTargetName` are directly inspectable.
 - optional `notifyGuid`, `duration`, and `trackIndex`
 - optional `props`, whose keys may be dotted property paths
 
+When a dotted path begins at a null editable instanced UObject property, create
+the owned subobject first with `<property>.@class`. The class must derive from
+the property's declared type; existing non-null subobjects are never replaced.
+
 The handler creates a point notify or notify state based on the resolved class.
 An existing event is updated when its GUID matches, or when class, name, and
 trigger time match within one millisecond. Notify states link both their start
@@ -36,6 +40,7 @@ Example:
   "duration": 0.8,
   "trackIndex": 2,
   "props": {
+    "RootMotionModifier.@class": "/Script/Example.ExampleWarpModifier",
     "RootMotionModifier.WarpTargetName": "Target",
     "RootMotionModifier.bWarpTranslation": true,
     "RootMotionModifier.RotationType": "Facing"

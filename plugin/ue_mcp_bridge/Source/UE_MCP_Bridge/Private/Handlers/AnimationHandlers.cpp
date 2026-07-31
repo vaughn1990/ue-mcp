@@ -159,6 +159,12 @@ void ExportNotifyProperties(
 		FObjectProperty* ObjectProperty = CastField<FObjectProperty>(Property);
 		UObject* SubObject = ObjectProperty ? ObjectProperty->GetObjectPropertyValue(ValuePtr) : nullptr;
 		const bool bOwnedSubObject = SubObject && SubObject->IsIn(Object);
+		if (bOwnedSubObject)
+		{
+			OutProperties->SetStringField(
+				PropertyPath + TEXT(".@class"),
+				SubObject->GetClass()->GetPathName());
+		}
 		if (!bOwnedSubObject)
 		{
 			FString ExportedValue;
@@ -235,9 +241,97 @@ bool ApplyNotifyProperties(
 	{
 		return true;
 	}
+
+	// A newly created notify state may leave an editable instanced UObject
+	// property null (for example a root-motion modifier).  Allow callers to
+	// create that owned subobject before applying its dotted child fields:
+	//   "RootMotionModifier.@class": "/Script/Module.ModifierClass"
 	for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Props->Values)
 	{
-		if (Pair.Key.Equals(TEXT("duration"), ESearchCase::IgnoreCase))
+		if (!Pair.Key.EndsWith(TEXT(".@class"), ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+
+		const FString PropertyPath = Pair.Key.LeftChop(7);
+		FString RequestedClassPath;
+		if (!Pair.Value.IsValid() || !Pair.Value->TryGetString(RequestedClassPath))
+		{
+			OutError = FString::Printf(TEXT("%s must be a class-path string"), *Pair.Key);
+			return false;
+		}
+
+		FProperty* Property = nullptr;
+		void* ValuePtr = nullptr;
+		UObject* LeafOwner = nullptr;
+		if (!MCPJsonProperty::ResolveDottedPath(
+				NotifyObject,
+				PropertyPath,
+				Property,
+				ValuePtr,
+				LeafOwner,
+				OutError))
+		{
+			OutError = FString::Printf(TEXT("%s: %s"), *Pair.Key, *OutError);
+			return false;
+		}
+
+		FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property);
+		if (!ObjectProperty || !Property->HasAnyPropertyFlags(CPF_InstancedReference))
+		{
+			OutError = FString::Printf(
+				TEXT("%s does not identify an instanced UObject property"),
+				*PropertyPath);
+			return false;
+		}
+
+		UClass* RequestedClass = LoadObject<UClass>(nullptr, *RequestedClassPath);
+		if (!RequestedClass)
+		{
+			RequestedClass = FindFirstObject<UClass>(
+				*RequestedClassPath,
+				EFindFirstObjectOptions::NativeFirst);
+		}
+		if (!RequestedClass || !RequestedClass->IsChildOf(ObjectProperty->PropertyClass))
+		{
+			OutError = FString::Printf(
+				TEXT("Class '%s' is not compatible with %s"),
+				*RequestedClassPath,
+				*ObjectProperty->PropertyClass->GetPathName());
+			return false;
+		}
+
+		UObject* ExistingSubObject = ObjectProperty->GetObjectPropertyValue(ValuePtr);
+		if (ExistingSubObject)
+		{
+			if (!ExistingSubObject->IsA(RequestedClass))
+			{
+				OutError = FString::Printf(
+					TEXT("%s already contains '%s', not '%s'"),
+					*PropertyPath,
+					*ExistingSubObject->GetClass()->GetPathName(),
+					*RequestedClass->GetPathName());
+				return false;
+			}
+			continue;
+		}
+
+		UObject* NewSubObject = NewObject<UObject>(
+			LeafOwner ? LeafOwner : NotifyObject,
+			RequestedClass,
+			NAME_None,
+			RF_Transactional);
+		ObjectProperty->SetObjectPropertyValue(ValuePtr, NewSubObject);
+		if (bOutChanged)
+		{
+			*bOutChanged = true;
+		}
+	}
+
+	for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Props->Values)
+	{
+		if (Pair.Key.Equals(TEXT("duration"), ESearchCase::IgnoreCase)
+			|| Pair.Key.EndsWith(TEXT(".@class"), ESearchCase::IgnoreCase))
 		{
 			continue;
 		}
