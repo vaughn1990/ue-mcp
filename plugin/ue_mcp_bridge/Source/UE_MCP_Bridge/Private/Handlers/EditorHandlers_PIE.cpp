@@ -786,7 +786,8 @@ TSharedPtr<FJsonValue> FEditorHandlers::GetPiePawn(const TSharedPtr<FJsonObject>
 
 // #228/#229: invoke a BlueprintCallable / Exec UFUNCTION on a target.
 // Target resolution: actorLabel against the chosen world (editor by
-// default; world="pie" for PIE). The 'args' object maps parameter names
+// default; world="pie" for PIE).  Multi-client PIE callers can select a
+// specific client with pieInstance and/or worldPath. The 'args' object maps parameter names
 // to JSON values which are converted via FProperty ImportText. Out
 // parameters and return values are read back via the same export path.
 
@@ -804,12 +805,24 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeFunction(const TSharedPtr<FJsonObj
 	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
 
 	const FString WorldScope = OptionalString(Params, TEXT("world"), TEXT("editor")).ToLower();
+	const int32 PieInstance = OptionalInt(Params, TEXT("pieInstance"), INDEX_NONE);
+	const FString WorldPath = OptionalString(Params, TEXT("worldPath"), TEXT(""));
+	if ((PieInstance != INDEX_NONE || !WorldPath.IsEmpty()) && WorldScope != TEXT("pie"))
+	{
+		return MCPError(TEXT("pieInstance and worldPath require world='pie'"));
+	}
 	UWorld* World = nullptr;
+	const FWorldContext* PieContext = nullptr;
 	if (WorldScope == TEXT("pie"))
 	{
-		FWorldContext* PieCtx = GEditor ? GEditor->GetPIEWorldContext() : nullptr;
-		World = PieCtx ? PieCtx->World() : nullptr;
-		if (!World) return MCPError(TEXT("PIE not running - cannot invoke against PIE world"));
+		PieContext = FindPIEWorldContext(PieInstance, WorldPath);
+		World = PieContext ? PieContext->World() : nullptr;
+		if (!World)
+		{
+			return MCPError(FString::Printf(
+				TEXT("No PIE world matched pieInstance=%d, worldPath='%s'. Available PIE worlds: %s"),
+				PieInstance, *WorldPath, *DescribePIEWorlds()));
+		}
 	}
 	else
 	{
@@ -965,6 +978,9 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeFunction(const TSharedPtr<FJsonObj
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
 	if (!ComponentName.IsEmpty()) Result->SetStringField(TEXT("component"), ComponentName);
 	Result->SetStringField(TEXT("functionName"), FunctionName);
+	Result->SetStringField(TEXT("world"), WorldScope);
+	Result->SetStringField(TEXT("worldPath"), World->GetPathName());
+	if (PieContext) Result->SetNumberField(TEXT("pieInstance"), PieContext->PIEInstance);
 
 	TSharedPtr<FJsonObject> OutVals = MakeShared<FJsonObject>();
 	for (TFieldIterator<FProperty> It(Func); It && (It->PropertyFlags & CPF_Parm); ++It)

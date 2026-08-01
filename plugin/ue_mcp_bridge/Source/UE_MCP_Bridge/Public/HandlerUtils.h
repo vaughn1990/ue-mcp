@@ -503,18 +503,66 @@ inline UWorld* GetEditorWorld()
 	return GEditor->GetEditorWorldContext().World();
 }
 
-/** Get the active PIE/Game world if one is running, or nullptr. */
-inline UWorld* GetPIEWorld()
+/**
+ * Find a running PIE/Game world context.  Supplying PieInstance and/or
+ * WorldPath selects one client in a multi-client PIE session; leaving both
+ * unset preserves the historic "first active PIE world" behaviour.
+ */
+inline const FWorldContext* FindPIEWorldContext(
+	const int32 PieInstance = INDEX_NONE,
+	const FString& WorldPath = FString())
 {
 	if (!GEngine) return nullptr;
-	for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+	for (const FWorldContext& Context : GEngine->GetWorldContexts())
 	{
-		if (Ctx.WorldType == EWorldType::PIE || Ctx.WorldType == EWorldType::Game)
+		if (Context.WorldType != EWorldType::PIE && Context.WorldType != EWorldType::Game)
 		{
-			if (UWorld* W = Ctx.World()) return W;
+			continue;
 		}
+
+		UWorld* World = Context.World();
+		if (!World)
+		{
+			continue;
+		}
+		if (PieInstance != INDEX_NONE && Context.PIEInstance != PieInstance)
+		{
+			continue;
+		}
+		if (!WorldPath.IsEmpty() && !World->GetPathName().Equals(WorldPath, ESearchCase::CaseSensitive))
+		{
+			continue;
+		}
+		return &Context;
 	}
 	return nullptr;
+}
+
+/** Get the active PIE/Game world if one is running, or nullptr. */
+inline UWorld* GetPIEWorld(const int32 PieInstance = INDEX_NONE, const FString& WorldPath = FString())
+{
+	const FWorldContext* Context = FindPIEWorldContext(PieInstance, WorldPath);
+	return Context ? Context->World() : nullptr;
+}
+
+/** Format the currently running PIE worlds for actionable target-selection errors. */
+inline FString DescribePIEWorlds()
+{
+	if (!GEngine) return TEXT("none");
+
+	TArray<FString> Worlds;
+	for (const FWorldContext& Context : GEngine->GetWorldContexts())
+	{
+		if (Context.WorldType != EWorldType::PIE && Context.WorldType != EWorldType::Game)
+		{
+			continue;
+		}
+		if (UWorld* World = Context.World())
+		{
+			Worlds.Add(FString::Printf(TEXT("{pieInstance:%d, worldPath:%s}"), Context.PIEInstance, *World->GetPathName()));
+		}
+	}
+	return Worlds.IsEmpty() ? TEXT("none") : FString::Join(Worlds, TEXT(", "));
 }
 
 /** Resolve a world scope string ("editor"|"pie"|"game"|"auto") to a UWorld. "auto" prefers PIE if running. */
