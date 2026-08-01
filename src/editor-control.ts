@@ -210,37 +210,29 @@ export async function startEditor(project: ProjectContext): Promise<{ success: b
   }
 }
 
-// Ask the editor to quit ITSELF, on the game thread, via a deferred slate tick
-// so the bridge can reply before the process exits. This is a clean in-process
-// exit, not an OS kill.
-const EDITOR_SELF_QUIT_PY = [
-  "import unreal",
-  "def _ue_mcp_quit(dt):",
-  "    try:",
-  "        unreal.SystemLibrary.quit_editor()",
-  "    except Exception as e:",
-  "        unreal.log_error('ue-mcp quit_editor failed: ' + str(e))",
-  "unreal.register_slate_post_tick_callback(_ue_mcp_quit)",
-].join("\n");
-
-/** Read the project's live bridge port from its lockfile, else env, else 9877. */
-function resolveBridgePort(projectDir?: string): number {
+/** Read the project's live bridge endpoint from its lockfile. */
+function resolveBridgeEndpoint(projectDir?: string): { port: number; pid: number | null } {
   if (projectDir) {
     try {
       const raw = fs.readFileSync(path.join(projectDir, "Saved", "UE_MCP_Bridge", "port.json"), "utf-8");
-      const p = JSON.parse(raw) as { port?: unknown };
-      if (typeof p.port === "number" && p.port > 0) return p.port;
+      const p = JSON.parse(raw) as { port?: unknown; pid?: unknown };
+      if (typeof p.port === "number" && p.port > 0) {
+        return {
+          port: p.port,
+          pid: typeof p.pid === "number" && Number.isInteger(p.pid) && p.pid > 0 ? p.pid : null,
+        };
+      }
     } catch { /* fall through to defaults */ }
   }
   const env = Number(process.env.UE_MCP_PORT);
-  return Number.isFinite(env) && env > 0 ? env : 9877;
+  return { port: Number.isFinite(env) && env > 0 ? env : 9877, pid: null };
 }
 
 /**
- * Ask the editor to quit itself via the bridge (`execute_python` -> quit_editor).
+ * Ask the editor to enter its native MainFrame close path.
  * Returns true if the request was delivered. Never touches the OS process table.
  */
-function requestEditorSelfQuit(port: number): Promise<boolean> {
+export function requestEditorSelfClose(port: number): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     let settled = false;
     const ws = new WebSocket(`ws://127.0.0.1:${port}`);
@@ -251,25 +243,42 @@ function requestEditorSelfQuit(port: number): Promise<boolean> {
       resolve(v);
     };
     const timer = setTimeout(() => finish(false), 8000);
-    ws.on("open", () => ws.send(JSON.stringify({ id: "ue-mcp-stop", method: "execute_python", params: { code: EDITOR_SELF_QUIT_PY } })));
-    ws.on("message", () => { clearTimeout(timer); finish(true); });
+    ws.on("open", () => ws.send(JSON.stringify({ id: "ue-mcp-stop", method: "request_editor_close", params: {} })));
+    ws.on("message", (data) => {
+      clearTimeout(timer);
+      try {
+        const response = JSON.parse(data.toString()) as { error?: unknown; result?: { success?: unknown } };
+        finish(!response.error && response.result?.success === true);
+      } catch {
+        finish(false);
+      }
+    });
     ws.on("error", () => { clearTimeout(timer); finish(false); });
   });
 }
 
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Stop the editor by asking it to quit ITSELF through the bridge. ue-mcp NEVER
+ * Stop the editor by asking its MainFrame to run the normal close sequence. ue-mcp NEVER
  * issues an OS kill: `taskkill /IM UnrealEditor.exe` matches by image name and
  * would also close the user's other editors (e.g. their real project). `force`
  * is accepted for back-compat but there is deliberately no force-kill path.
- * Success is confirmed by the project's own bridge port going quiet, so it is
+ * Success is confirmed by the PID from the project's bridge lockfile, so it is
  * specific to this editor even when others are open.
  */
 export async function stopEditor(force = false, projectDir?: string): Promise<{ success: boolean; message: string }> {
   void force;
   if (!IS_WINDOWS) return { success: false, message: WINDOWS_ONLY_MSG };
 
-  const port = resolveBridgePort(projectDir);
+  const { port, pid } = resolveBridgeEndpoint(projectDir);
   const bridgeUp = await isBridgeAvailable("127.0.0.1", port);
   if (!bridgeUp && !isEditorRunning()) {
     return { success: false, message: "Editor is not running" };
@@ -281,7 +290,7 @@ export async function stopEditor(force = false, projectDir?: string): Promise<{ 
     };
   }
 
-  const quitSent = await requestEditorSelfQuit(port);
+  const quitSent = await requestEditorSelfClose(port);
   if (!quitSent) {
     return {
       success: false,
@@ -289,16 +298,25 @@ export async function stopEditor(force = false, projectDir?: string): Promise<{ 
     };
   }
 
-  // Confirm via the project's own bridge port closing - specific to this editor.
+  // Do not probe the bridge again while Unreal is tearing it down. A fresh TCP
+  // connection creates another native connection worker during module shutdown.
+  // The per-project lockfile identifies the exact editor PID, so poll that
+  // process instead of touching the socket.
+  if (pid === null) {
+    return {
+      success: true,
+      message: "Editor accepted its native MainFrame close request; no lockfile PID was available to confirm process exit",
+    };
+  }
   for (let i = 0; i < 20; i++) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
-    if (!(await isBridgeAvailable("127.0.0.1", port))) {
-      return { success: true, message: "Editor quit itself via the bridge" };
+    if (!isProcessRunning(pid)) {
+      return { success: true, message: "Editor closed through its native MainFrame shutdown path" };
     }
   }
   return {
     success: false,
-    message: "Asked the editor to quit but its bridge is still up after 20s. Close it manually - ue-mcp never force-kills processes.",
+    message: "Asked the editor to close but its process is still running after 20s. A save or shutdown prompt may be waiting; ue-mcp never force-kills processes.",
   };
 }
 

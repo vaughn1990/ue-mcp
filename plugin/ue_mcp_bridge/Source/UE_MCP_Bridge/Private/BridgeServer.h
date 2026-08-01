@@ -8,6 +8,7 @@
 #include "HAL/Runnable.h"
 #include "HAL/RunnableThread.h"
 #include "HAL/ThreadSafeBool.h"
+#include "HAL/ThreadSafeCounter.h"
 #include "Containers/Queue.h"
 
 #if PLATFORM_WINDOWS
@@ -67,6 +68,9 @@ private:
 	FRunnableThread* ServerThread;
 	FThreadSafeBool bShouldStop;
 	FThreadSafeBool bIsRunning;
+	// Connection workers capture this server. Shutdown joins the accept thread
+	// and then waits for this count to reach zero before the server is destroyed.
+	FThreadSafeCounter ActiveConnectionTasks;
 
 	// Handler registry
 	FMCPHandlerRegistry HandlerRegistry;

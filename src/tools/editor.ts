@@ -20,7 +20,11 @@ export const editorTool: ToolDef = categoryTool(
       },
     },
     stop_editor: {
-      description: "Close Unreal Editor gracefully (asks the editor to quit itself via the bridge; never an OS kill)",
+      description: "Close Unreal Editor gracefully through its native MainFrame shutdown path (never an OS kill)",
+      // Metadata for TS/C++ drift auditing. The custom handler opens a
+      // project-specific one-shot socket because the normal shared bridge is
+      // expected to disconnect during this lifecycle operation.
+      bridge: "request_editor_close",
       handler: async (ctx: ToolContext) => {
         return stopEditor(false, ctx.project.projectDir ?? undefined);
       },

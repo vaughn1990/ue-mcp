@@ -638,7 +638,7 @@ UE-MCP exposes **<!-- count:tools -->24<!-- /count --> category tools** covering
 | Action | Description |
 |--------|-------------|
 | `start_editor` | Launch Unreal Editor with the current project and reconnect bridge |
-| `stop_editor` | Close Unreal Editor gracefully |
+| `stop_editor` | Close Unreal Editor gracefully through Unreal's native MainFrame shutdown path. The bridge acknowledges first, then Unreal tears down PIE, asset editors, delegates, and the editor process in its normal order; no OS kill is used. |
 | `restart_editor` | Stop then start the editor |
 | `build_project` | Build the project's C++ code using Unreal Build Tool. Editor should be stopped first |
 | `execute_command` | Run console command. Params: `command` |
