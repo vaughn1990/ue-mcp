@@ -113,6 +113,9 @@ private:
 	// Handler implementations
 	static TSharedPtr<FJsonValue> ExecuteCommand(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ExecutePython(const TSharedPtr<FJsonObject>& Params);
+	// Request the editor's normal MainFrame shutdown path after the bridge has
+	// returned its acknowledgement. This is deliberately not QUIT_EDITOR.
+	static TSharedPtr<FJsonValue> RequestEditorClose(const TSharedPtr<FJsonObject>& Params);
 	// #142: run a Python file with __file__/__name__ context populated
 	static TSharedPtr<FJsonValue> RunPythonFile(const TSharedPtr<FJsonObject>& Params);
 	// #719: purge cached embedded-Python modules by prefix (tool-dev iteration)

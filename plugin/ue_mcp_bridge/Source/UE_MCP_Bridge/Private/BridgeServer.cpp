@@ -139,6 +139,23 @@ void FMCPBridgeServer::Shutdown()
 		ServerThread = nullptr;
 	}
 
+	// HandleWebSocketConnection runs on worker threads that capture this server.
+	// The accept thread is joined above, so no new workers can start now. Existing
+	// workers observe bShouldStop and leave their select loops; wait for them to
+	// release their final raw-this access before the module resets the server.
+	double NextConnectionWaitWarning = FPlatformTime::Seconds() + 10.0;
+	while (ActiveConnectionTasks.GetValue() > 0)
+	{
+		FPlatformProcess::Sleep(0.01f);
+		if (FPlatformTime::Seconds() >= NextConnectionWaitWarning)
+		{
+			UE_LOG(LogMCPBridge, Warning,
+				TEXT("[UE-MCP] Still waiting for %d bridge connection worker(s) during shutdown"),
+				ActiveConnectionTasks.GetValue());
+			NextConnectionWaitWarning = FPlatformTime::Seconds() + 10.0;
+		}
+	}
+
 	bIsRunning = false;
 }
 
@@ -292,8 +309,10 @@ uint32 FMCPBridgeServer::Run()
 				ANSI_TO_TCHAR(AddrStr), ntohs(ClientAddr.sin_port));
 				
 				// Handle each WebSocket connection in its own thread
+				ActiveConnectionTasks.Increment();
 				Async(EAsyncExecution::Thread, [this, ClientSocketFD]() {
 					HandleWebSocketConnection(ClientSocketFD);
+					ActiveConnectionTasks.Decrement();
 				});
 			}
 		}

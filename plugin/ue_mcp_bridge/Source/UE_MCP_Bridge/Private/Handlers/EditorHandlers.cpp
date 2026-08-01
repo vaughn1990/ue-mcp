@@ -35,6 +35,7 @@
 #include "RenderingThread.h"
 #include "Misc/AutomationTest.h"
 #include "HAL/PlatformProcess.h"
+#include "Containers/Ticker.h"
 #include "Slate/SceneViewport.h"
 #include "HAL/PlatformMemory.h"
 #include "Misc/App.h"
@@ -158,6 +159,7 @@ void FEditorHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	FMCPLogCapture::Get().Install();
 
 	Registry.RegisterHandler(TEXT("execute_command"), &ExecuteCommand);
+	Registry.RegisterHandler(TEXT("request_editor_close"), &RequestEditorClose);
 	Registry.RegisterHandler(TEXT("execute_python"), &ExecutePython);
 	Registry.RegisterHandler(TEXT("run_python_file"), &RunPythonFile);
 	Registry.RegisterHandler(TEXT("set_property"), &SetProperty);
@@ -229,6 +231,57 @@ void FEditorHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	// #727: open a registered editor tab / Project Settings viewer for visual evidence.
 	Registry.RegisterHandler(TEXT("open_tab"), &OpenTab);
 	Registry.RegisterHandler(TEXT("open_settings"), &OpenSettings);
+}
+
+TSharedPtr<FJsonValue> FEditorHandlers::RequestEditorClose(const TSharedPtr<FJsonObject>& Params)
+{
+	(void)Params;
+
+	// Handler dispatch is serialized onto the game thread. Keep the guard here
+	// so repeated stop requests cannot enqueue multiple MainFrame close passes.
+	static bool bCloseScheduled = false;
+	if (bCloseScheduled)
+	{
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetBoolField(TEXT("success"), true);
+		Result->SetBoolField(TEXT("alreadyScheduled"), true);
+		Result->SetStringField(TEXT("shutdownPath"), TEXT("CLOSE_SLATE_MAINFRAME"));
+		return MCPResult(Result);
+	}
+
+	if (!GEditor || !GEngine)
+	{
+		return MCPError(TEXT("Editor is not available for a graceful close"));
+	}
+
+	bCloseScheduled = true;
+
+	// Do not call QUIT_EDITOR (directly or through UKismetSystemLibrary). The
+	// MainFrame owns the orderly shutdown sequence: prompts, PIE teardown,
+	// editor-close delegates, asset-editor/toolkit teardown, and only then its
+	// own deferred QUIT_EDITOR. Delay adding the command so the bridge worker
+	// can serialize and send this handler's acknowledgement first.
+	FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateLambda([](float) -> bool
+		{
+			if (GEngine)
+			{
+				GEngine->DeferredCommands.AddUnique(TEXT("CLOSE_SLATE_MAINFRAME"));
+			}
+			// The one-shot callback has run. If MainFrame later declines the
+			// close (for example, the user cancels a prompt), a future explicit
+			// stop request must be allowed to schedule another attempt.
+			bCloseScheduled = false;
+			return false;
+		}),
+		0.25f);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetBoolField(TEXT("alreadyScheduled"), false);
+	Result->SetStringField(TEXT("shutdownPath"), TEXT("CLOSE_SLATE_MAINFRAME"));
+	Result->SetNumberField(TEXT("deferSeconds"), 0.25);
+	return MCPResult(Result);
 }
 
 TSharedPtr<FJsonValue> FEditorHandlers::ExecuteCommand(const TSharedPtr<FJsonObject>& Params)
